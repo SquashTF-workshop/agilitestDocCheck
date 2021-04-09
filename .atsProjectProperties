@@ -1,0 +1,21 @@
+<atsProject>
+  <domain>squash.tfauto</domain>
+  <name>agilitestDocCheck</name>
+  <version>0.0.1</version>
+  <description>ATS project created with Agilitest Editor</description>
+  <useMaven>false</useMaven>
+  <autoUpdateAts>true</autoUpdateAts>
+  <useProjectDomain>false</useProjectDomain>
+  <uuid>0FD8E230-1839-5F10-3119-B5BF95D7E455</uuid>
+  <groups>
+    <group>default</group>
+  </groups>
+  <environment>
+    <property>DSNAME</property>
+    <property>DS_param</property>
+    <property>TC_CUF_tc</property>
+    <property>TS_CUF_ts</property>
+    <property>CPG_CUF_cpg</property>
+    <property>IT_CUF_ite</property>
+  </environment>
+</atsProject>
