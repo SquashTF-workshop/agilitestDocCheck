@@ -17,7 +17,7 @@ public class getRunnerNamePrem extends ActionTestScript{
 	 */
 
 	@Test
-	public void testMain(){
+	public void testMain() throws Exception{
 		// -----------------------------------------------
 		// Get parameters passed by the calling script :
 		// getParameter(int index)
@@ -50,13 +50,13 @@ public class getRunnerNamePrem extends ActionTestScript{
                   throw new Exception (getParameter(2) + " is not equal to campaign");
                 }
                 if (!getParameter(3).toString().equals("iteration")){
-                  throw new Exception (getParameter(0) + " is not equal to iteration");
+                  throw new Exception (getParameter(3) + " is not equal to iteration");
                 }
                 if (!getParameter(4).toString().equals("dataset1")){
-                  throw new Exception (getParameter(1) + " is not equal to dataset1");
+                  throw new Exception (getParameter(4) + " is not equal to dataset1");
                 }
                 if (!getParameter(5).toString().equals("dsvalue1")){
-                  throw new Exception (getParameter(2) + " is not equal to dsvalue1");
+                  throw new Exception (getParameter(5) + " is not equal to dsvalue1");
                 }                
 
                 returnValues("Squash TF Java Junit Runner");
