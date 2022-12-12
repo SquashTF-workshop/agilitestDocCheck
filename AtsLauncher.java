@@ -5,9 +5,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,65 +20,351 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.StringJoiner;
+import java.util.function.Consumer;
+import java.util.function.IntConsumer;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+
 public class AtsLauncher {
 
-	private static String atsToolsUrl = "http://www.actiontestscript.com";
+	/**
+	 * AtsLauncher is a Java class used as a simple script file with Java >= 14
+	 * This script will try to update ATS tools and will launch ATS execution suites
+	 */
 
-	private static void printLog(String data) {
-		System.out.println("[ATS-LAUNCHER] " + data);
-	}
+	private static final String ATS_TOOLS_SERVER = "https://actiontestscript.com/tools/versions.php";
+	private static final String ATS_JENKINS_TOOLS = "userContent/tools/versions.csv";
+	private static final String ATS_TOOLS_FOLDER = System.getProperty("user.home") + "/.actiontestscript/tools";
 
-	public static void main(String[] args) throws IOException, InterruptedException {
+	private static final String TARGET = "target";
+	private static final String ATS_OUTPUT = "ats-output";
+	private static final String BUILD_PROPERTIES = "build.properties";
 
-		boolean buildOnly = false;
-		String suiteFiles = "suite";
-		String reportLevel = "1";
+	/**
+	 * This script file will launch ATS suite tests using ATS tools components available on ActionTestScript server or on a local installation
+	 * 
+	 * Available options for launching ATS suites :
+	 * 
+	 * 'prepareMaven' : Prepare 'build.properties' file that maven can use to find ATS tools for ATS tests executions
+	 * 'buildEnvironment' : Only try to get ATS tools path and create 'build.properties' file that can be used by Maven launch test process
+	 * 'suiteXmlFiles' : Comma separated names of ATS suites xml files in 'exec' folder of current project, to be launched by this script
+	 * 'atsReport' : Report details level
+	 *				1 - Simple execution report
+	 *				2 - Detailed execution report
+	 *				3 - Detailed execution report with screen-shot
+	 * 'validationReport' : Generate proof of functional execution with screen-shot
+	 * 'atsListScripts' : List of ats scripts that can be launched using a temp suite execution
+	 * 'tempSuiteName' : If 'atsListScripts' option is defined this option override default suite name ('tempSuite')
+	 * 'disableSsl' : Disable trust certificat check when using ActionTestScript tools server
+	 * 'atsToolsUrl' : Alternative url path to ActionTestScript tools server (the server have to send a list of ATS tools in a comma separated values data (name, version, folder_name, zip_archive_url).
+	 * 'jenkinsUrl' : Url of a Jenkins server with saved ATS tools archives, tools will be available at [Jenkins_Url_Server]/userContent/tools using 'version.csv' files with names, versions and path of ATS tools
+	 * 'reportsDirectory' (or 'output') : This is the output folder for all files generated during execution of ATS tests suites
+	 * 'outbound' : By default, this script will try to contact ActionTestScript tools server.
+	 *             if this value is set to 'false', 'off' or '0', this script will try to find tools on local installation using following ordered methods :
+	 * 				- 'atsToolsFolder' property in '.atsProjectProperties' file in current project folder
+	 * 				- 'ATS_TOOLS' environment variable set on current machine
+	 *				- 'userprofile' folder directory : [userprofile]/.actiontestscript/tools
+	 *
+	 * About '.atsProjectProperties' file in current project folder in xml format : 
+	 * - if tag 'atsToolsFolder' found : the value will define the local folder path of ATS tools
+	 * - if tag 'atsToolsUrl' found : the standard ATS tools url server will be overwritten
+	 * - if tag 'outbound' found : if the value is false, off or 0, no request will be send to get ATS tools
+	 *
+	 */
 
-		for(int i=0; i<args.length; i++) {
-			if(args[i].startsWith("-buildEnvironment")) {
-				buildOnly = true;
-				break;
-			}else {
-				if(args[i].startsWith("-suiteXmlFiles=")) {
-					suiteFiles = args[i].substring(15);
-				}else if(args[i].startsWith("-ats-report=")) {
-					reportLevel = args[i].substring(12);
-				}else if(args[i].startsWith("-toolsUrl=")) {
-					atsToolsUrl = args[i].substring(10);
+	private static String suiteFiles = "suite";
+	private static String atsScripts = "";
+	private static String tempSuiteName = "tempSuite";
+	private static String reportLevel = "0";
+	private static String validationReport = "0";
+	private static String output = TARGET + "/" + ATS_OUTPUT;
+
+	private static String atsToolsFolderProperty = "atsToolsFolder";
+	private static String atsToolsUrlProperty = "atsToolsUrl";
+	private static String outboundProperty = "outbound";
+	private static String disableSSLParam = "disableSSL";
+
+	private static String atsToolsFolder = null;
+	private static String atsToolsUrl = null;
+
+	private static String atsHomePath = null;
+	private static String jdkHomePath = null;
+
+	private static final List<String> trueList = Arrays.asList(new String[] {"on", "true", "1", "yes", "y"});
+	private static final List<String> falseList = Arrays.asList(new String[] {"off", "false", "0", "no", "n"});
+
+	private static final List<AtsToolEnvironment> atsToolsEnv = 
+			Arrays.asList(new AtsToolEnvironment[] {
+					new AtsToolEnvironment("ats"),
+					new AtsToolEnvironment("jasper"),
+					new AtsToolEnvironment("jdk")});
+
+	//------------------------------------------------------------------------------------------------------------
+	// Main script execution
+	//------------------------------------------------------------------------------------------------------------
+
+	public static void main(String[] args) throws Exception, InterruptedException {
+
+		final Integer javaVersion = Runtime.version().version().get(0);
+
+		if(javaVersion < 14){
+			printLog("Java version " + javaVersion + " found, minimum version 14 is needed to execute this script !");
+			System.exit(0);
+		}
+		printLog("Java version " + javaVersion + " found, start AtsLauncher execution ...");
+
+		final File script = new File(AtsLauncher.class.getProtectionDomain().getCodeSource().getLocation().getPath());
+		final Path projectFolderPath = Paths.get(script.getParent().replace("%20", " "));
+		final Path targetFolderPath = projectFolderPath.resolve(TARGET);
+
+		printLog("AtsLauncher script in ATS project folder -> " + projectFolderPath.toString());
+
+		String jenkinsToolsUrl = null;
+		boolean buildEnvironment = false;
+		boolean outboundTraffic = true;
+		boolean disableSSLTrust = false;
+
+		//-------------------------------------------------------------------------------------------------
+		// Read atsProjectProperties file
+		//-------------------------------------------------------------------------------------------------
+
+		final DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+		final Path propFilePath = projectFolderPath.resolve(".atsProjectProperties").toAbsolutePath();
+		try (InputStream is = new FileInputStream(propFilePath.toString())) {
+
+			final DocumentBuilder db = dbf.newDocumentBuilder();
+			final Document doc = db.parse(is);
+
+			if (doc.hasChildNodes()) {
+				final Node root = doc.getChildNodes().item(0);
+				if (root.hasChildNodes()) {
+					final NodeList childs = root.getChildNodes();
+					for(int i=0; i<childs.getLength(); i++) {
+
+						final String nodeName = childs.item(i).getNodeName();
+						final String textContent = childs.item(i).getTextContent().trim();
+
+						if(atsToolsFolderProperty.equalsIgnoreCase(nodeName)){
+							atsToolsFolder = textContent;
+						}else if(atsToolsUrlProperty.equalsIgnoreCase(nodeName)) {
+							atsToolsUrl = textContent;
+						}else if(outboundProperty.equalsIgnoreCase(nodeName)) {
+							outboundTraffic = falseList.indexOf(textContent.toLowerCase()) == -1;
+						}else if(disableSSLParam.equalsIgnoreCase(nodeName)) {
+							disableSSLTrust = trueList.indexOf(textContent.toLowerCase()) > -1;
+						}
+					}
 				}
 			}
-		}		
 
-		deleteDirectory(Paths.get("target"));
-		deleteDirectory(Paths.get("test-output"));
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 
-		final Path atsFolder = Paths.get(System.getProperty("user.home"), ".actiontestscript");
+		//-------------------------------------------------------------------------------------------------
+		// Read command line arguments
+		//-------------------------------------------------------------------------------------------------
 
-		final Path atsTools = atsFolder.resolve("tools");
-		printLog("Using tools folder : " + atsTools.toString());
+		for(int i=0; i<args.length; i++) {
 
-		List<String> envList = new ArrayList<String>();
+			final String allArgs = args[i].replaceAll("\\-", "").trim();
+			final String firstArg = allArgs.toLowerCase();
+			final int equalPos = firstArg.indexOf("=");
+						
+			if(equalPos == -1) {
+				if("buildenvironment".equals(firstArg) || "preparemaven".equals(firstArg)) {
+					buildEnvironment = true;
+				}else if("disablessl".equals(firstArg)) {
+					disableSSLTrust = true;
+				}
+			}else {
+				final String argName = firstArg.substring(0, equalPos);
+				final String argValue = allArgs.substring(equalPos+1).trim();
+				
+				switch (argName) {
+				case "suitexmlfiles":
+					suiteFiles = argValue;
+					break;
+				case "atslistscripts":
+					atsScripts = argValue;
+					break;
+				case "tempsuitename":
+					if(argValue.length() > 0){
+						tempSuiteName = argValue;
+					}
+					break;
+				case "preparemaven":
+					buildEnvironment = trueList.indexOf(argValue.toLowerCase()) != -1;
+					break;
+				case "reportlevel":
+				case "atsreport":
+					reportLevel = argValue;
+					break;
+				case "validationreport":
+					validationReport = argValue;
+					break;
+				case "reportsdirectory":
+				case "output":
+					output = argValue;
+					break;
+				case "atstoolsurl":
+					atsToolsUrl = argValue;
+					break;
+				case "atstoolsfolder":
+					atsToolsFolder = argValue;
+					break;
+				case "outbound":
+					outboundTraffic = falseList.indexOf(argValue.toLowerCase()) == -1;
+					break;
+				case "disablessl":
+					disableSSLTrust = trueList.indexOf(argValue.toLowerCase()) > -1;
+					break;
+				case "jenkinsurl":
+					jenkinsToolsUrl = argValue;
+					if(!jenkinsToolsUrl.endsWith("/")) {
+						jenkinsToolsUrl += "/";
+					}
+					jenkinsToolsUrl += ATS_JENKINS_TOOLS;
+					break;
+				}
+			}
+		}
+		
+		//-------------------------------------------------------------------------------------------------
+		// Check if SSL certificates trust is disabled
+		//-------------------------------------------------------------------------------------------------
 
-		createEnVar(envList, "jasper", atsTools);
+		if(disableSSLTrust) {
+			disableSSL();
+		}
 
-		String[] env = createEnVar(envList, "ats", atsTools);
-		String atsHomePath = Paths.get(env[1]).toAbsolutePath().toString();
+		//-------------------------------------------------------------------------------------------------
+		// Check and delete output directories
+		//-------------------------------------------------------------------------------------------------
 
-		env = createEnVar(envList, "jdk", atsTools);
-		String jdkHomePath = Paths.get(env[1]).toAbsolutePath().toString();
+		Path atsOutput = Paths.get(output);
+		if(!atsOutput.isAbsolute()) {
+			atsOutput = projectFolderPath.resolve(output);
+		}
 
-		if(buildOnly) {
-			Path buildProperties = Paths.get("build.properties");
-			Files.deleteIfExists(buildProperties);
-			Files.write(buildProperties, String.join("\n", envList).getBytes(), StandardOpenOption.CREATE);
+		deleteDirectory(targetFolderPath);
+		deleteDirectory(atsOutput);
+
+		deleteDirectory(projectFolderPath.resolve("test-output"));
+
+		//-------------------------------------------------------------------------------------------------
+		// Check list ATS scripts
+		//-------------------------------------------------------------------------------------------------
+
+		if(atsScripts != null && atsScripts.trim().length() > 0) {
+
+			Files.createDirectories(Paths.get(TARGET));
+			suiteFiles = TARGET + "/" + tempSuiteName + ".xml";
+
+			final StringBuilder builder = new StringBuilder("<!DOCTYPE suite SYSTEM \"https://testng.org/testng-1.0.dtd\">\n");
+			builder.append("<suite name=\"").append(tempSuiteName).append("\" verbose=\"0\">\n<test name=\"testMain\" preserve-order=\"true\">\n<classes>\n");
+
+			final Stream<String> atsScriptsList = Arrays.stream(atsScripts.split(","));
+			atsScriptsList.forEach(a -> addScriptToSuiteFile(builder, a));
+
+			builder.append("</classes>\n</test></suite>");
+
+			try (PrintWriter out = new PrintWriter(suiteFiles)) {
+				out.println(builder.toString());
+				out.close();
+			}
+		}
+
+		//-------------------------------------------------------------------------------------------------
+		// if ATS server url has not been set using default url
+		//-------------------------------------------------------------------------------------------------
+
+		if(atsToolsUrl == null) {
+			atsToolsUrl = ATS_TOOLS_SERVER;
+		}
+
+		//-------------------------------------------------------------------------------------------------
+		// try to get environment value
+		//-------------------------------------------------------------------------------------------------
+
+		if(atsToolsFolder == null) {
+			atsToolsFolder = System.getenv("ATS_TOOLS");
+		}
+
+		//-------------------------------------------------------------------------------------------------
+		// if ats folder not defined using 'userprofile' home directory
+		//-------------------------------------------------------------------------------------------------
+
+		if(atsToolsFolder == null) {
+			atsToolsFolder = ATS_TOOLS_FOLDER;
+		}
+
+		//-------------------------------------------------------------------------------------------------
+
+		final List<String> envList = new ArrayList<String>();
+
+		boolean serverFound = false;
+		String useNetworkInfo = "";
+
+		if(outboundTraffic) {
+			if(jenkinsToolsUrl != null) {
+				serverFound = checkAtsToolsVersions(true, jenkinsToolsUrl);
+			}else {
+				serverFound = checkAtsToolsVersions(false, atsToolsUrl);
+			}
+		}else {
+			useNetworkInfo = "(outbound traffic has been turned off by user)";
+		}
+
+		if(!serverFound) {
+
+			printLog("ATS tools server is not reachable " + useNetworkInfo);
+
+			atsToolsEnv.stream().forEach(e -> installAtsTool(e, envList, Paths.get(atsToolsFolder)));
+
+			if(atsToolsEnv.size() != envList.size()) {
+				printLog("ATS tools not found in folder -> " + atsToolsFolder);
+				System.exit(0);
+			}
+
+		}else {
+			atsToolsEnv.stream().forEach(e -> installAtsTool(e, envList));
+		}
+
+		if(buildEnvironment) {
+
+			final Path p = projectFolderPath.resolve(BUILD_PROPERTIES);
+			Files.deleteIfExists(p);
+
+			Files.write(p, String.join("\n", envList).getBytes(), StandardOpenOption.CREATE);
+
+			printLog("Build properties file created, AtsLauncher has terminated it's job !");
+
 		}else {
 
 			Map<String, String> userEnv = System.getenv();
@@ -82,38 +372,398 @@ public class AtsLauncher {
 				envList.add(0, envName + "=" + userEnv.get(envName));
 			}
 
-			File currentDirectory = Paths.get("").toAbsolutePath().toFile();
-			printLog("Current directory : " + currentDirectory.getAbsolutePath());
-			String[] envArray = envList.toArray(new String[envList.size()]);
+			final String[] envArray = envList.toArray(new String[envList.size()]);
+			final File projectDirectoryFile = projectFolderPath.toFile();
+			final Path generatedPath = targetFolderPath.resolve("generated");
+			final File generatedSourceDir = generatedPath.toFile();
+			final String generatedSourceDirPath = generatedSourceDir.getAbsolutePath();
 
-			printLog("Generate java files : " + Paths.get("target", "generated").toString());
-			execute(
-					"\"" + jdkHomePath + "/bin/java.exe\" -cp " + atsHomePath + "/libs/* com.ats.generator.Generator -prj \"" + currentDirectory.getAbsolutePath() + "\" -dest target/generated -force -suites " + suiteFiles, 
+			generatedSourceDir.mkdirs();
+
+			printLog("Project directory -> " + projectDirectoryFile.getAbsolutePath());
+			printLog("Generated java files -> " + generatedSourceDirPath);
+
+			final FullLogConsumer logConsumer = new FullLogConsumer();
+
+			final StringBuilder javaBuild = 
+					new StringBuilder("\"")
+					.append(Paths.get(jdkHomePath).toAbsolutePath().toString())
+					.append("/bin/java");
+
+			execute(new StringBuilder(javaBuild)
+					.append("\" -cp \"").append(atsHomePath).append("\"")
+					.append("/libs/* com.ats.generator.Generator -prj \"")
+					.append(projectFolderPath.toString())
+					.append("\" -dest \"")
+					.append(targetFolderPath.toString())
+					.append("/generated\" -force -suites ")
+					.append(suiteFiles),
 					envArray, 
-					currentDirectory);
+					projectDirectoryFile,
+					logConsumer,
+					logConsumer);
 
-			File sourceDir = Paths.get("target", "generated").toFile();
-			StringJoiner files = new StringJoiner("\n");
-			listJavaClasses(files, sourceDir.getAbsolutePath().length()+1, sourceDir);
+			final ArrayList<String> files = listJavaClasses(generatedSourceDirPath.length() + 1, generatedSourceDir);
 
-			Path classFolder = Paths.get("target", "classes").toAbsolutePath();
-			Path classFolderAssets = classFolder.resolve("assets");
+			final Path classFolder = targetFolderPath.resolve("classes").toAbsolutePath();
+			final Path classFolderAssets = classFolder.resolve("assets");
 			classFolderAssets.toFile().mkdirs();
 
-			copyFolder(Paths.get("src", "assets"), classFolderAssets);
+			copyFolder(projectFolderPath.resolve("src").resolve("assets"), classFolderAssets);
 
-			printLog("Compile classes : " + Paths.get("target", "classes").toString());
-			Files.write(Paths.get("target", "generated", "JavaClasses.list"), files.toString().getBytes(), StandardOpenOption.CREATE);
-			execute("\"" + jdkHomePath + "/bin/javac.exe\" -cp " + atsHomePath + "/libs/* -d \"" + classFolder.toString() + "\" @JavaClasses.list", 
-					envArray, 
-					Paths.get("target", "generated").toAbsolutePath().toFile());
+			printLog("Compile classes to folder -> " + classFolder.toString());
+			Files.write(generatedPath.resolve("JavaClasses.list"), String.join("\n", files).getBytes(), StandardOpenOption.CREATE);
 
-			printLog("Launch suites execution : " + suiteFiles);
-			execute("\"" + jdkHomePath + "/bin/java.exe\" -Doutput-folder=target/ats-output -Dats-report=" + reportLevel + " -cp " + atsHomePath + "/libs/*" + File.pathSeparator + "target/classes" + File.pathSeparator + "libs/* org.testng.TestNG target/suites.xml", 
+			execute(new StringBuilder(javaBuild)
+					.append("c\"") // javac
+					.append(" -cp ../../libs/*")
+					.append(File.pathSeparator)
+					.append("\"")
+					.append(atsHomePath)
+					.append("/libs/*\" -d \"")
+					.append(classFolder.toString())
+					.append("\" @JavaClasses.list"),
 					envArray, 
-					currentDirectory);
+					generatedPath.toAbsolutePath().toFile(),
+					logConsumer,
+					logConsumer);
+
+			printLog("Launch suite(s) execution -> " + suiteFiles);
+
+			execute(new StringBuilder(javaBuild)
+					.append("\"")
+					.append(" -Dats-report=").append(reportLevel)
+					.append(" -Dvalidation-report=").append(validationReport)
+					.append(" -cp \"").append(atsHomePath).append("\"")
+					.append("/libs/*")
+					.append(File.pathSeparator)
+					.append("\"").append(targetFolderPath.toString()).append("/classes\"")
+					.append(File.pathSeparator)
+					.append("libs/* org.testng.TestNG")
+					.append(" -d \"").append(atsOutput.toString()).append("\"")
+					.append(" \"").append(targetFolderPath.toString()).append("/suites.xml\""),
+					envArray, 
+					projectDirectoryFile,
+					logConsumer,
+					new TestNGLogConsumer());
+
 		}
 	}
+
+	//------------------------------------------------------------------------------------------------------------
+	// Functions
+	//------------------------------------------------------------------------------------------------------------
+
+	private static void addScriptToSuiteFile(StringBuilder builder, String scriptName) {
+		scriptName = scriptName.replaceAll("\\/", ".");
+		if(scriptName.endsWith(".ats")) {
+			scriptName = scriptName.substring(0, scriptName.length() - 4);
+		}
+
+		if(scriptName.startsWith(".")) {
+			scriptName = scriptName.substring(1);
+		}
+
+		builder.append("<class name=\"").append(scriptName).append("\"/>\n");
+	}
+
+	private static Map<String, String[]> getServerToolsVersion(String serverUrl){
+		final Map<String, String[]> versions = new HashMap<String, String[]>();
+		try {
+			final URL url = new URL(serverUrl);
+			final URLConnection yc = url.openConnection(); 
+			final BufferedReader in = new BufferedReader(new InputStreamReader(yc.getInputStream()));
+
+			String inputLine; 
+			while ((inputLine = in.readLine()) != null) { 
+				String[] lineData = inputLine.split(",");
+				versions.put(lineData[0], lineData);
+			} 
+			in.close();
+
+		} catch (IOException e) {}
+
+		return versions;
+	}
+
+	private static Boolean checkAtsToolsVersions(boolean localServer, String server) {
+
+		printLog("Using ATS tools server -> " + server);
+
+		final Map<String, String[]> versions = getServerToolsVersion(server);
+
+		if(versions.size() < atsToolsEnv.size() && localServer) {
+			printLog("Unable to get all ATS tools on this server -> " + server);
+			versions.putAll(getServerToolsVersion(atsToolsUrl));
+			if(versions.size() < atsToolsEnv.size()) {
+				return false;
+			}
+		}
+
+		for (AtsToolEnvironment t : atsToolsEnv) {
+			final String[] toolData = versions.get(t.name);
+			if(toolData != null){
+				final String folderName = toolData[2];
+				t.folderName = folderName;
+
+				final File toolFolder = Paths.get(atsToolsFolder).resolve(folderName).toFile();
+				if(toolFolder.exists()) {
+					t.folder = toolFolder.getAbsolutePath();
+				}else {
+					t.url = toolData[3];
+				}
+			}else{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	private static void toolInstalled(AtsToolEnvironment tool, List<String> envList) {
+		envList.add(tool.envName + "=" + tool.folder);
+		printLog("Set environment variable [" + tool.envName + "] -> " + tool.folder);
+
+		if("ats".equals(tool.name)) {
+			atsHomePath = tool.folder;
+		}else if("jdk".equals(tool.name)) {
+			jdkHomePath = tool.folder;
+		}
+	}
+
+	private static void installAtsTool(AtsToolEnvironment tool, List<String> envList, Path toolsPath) {
+		try (Stream<Path> stream = Files.walk(toolsPath, 1)) {
+			final List<String> folders = stream
+					.filter(file -> file != toolsPath && Files.isDirectory(file) && file.getFileName().toString().startsWith(tool.name))
+					.map(Path::getFileName)
+					.map(Path::toString)
+					.collect(Collectors.toList());
+
+			if(folders.size() > 0) {
+				folders.sort(Collections.reverseOrder());
+
+				tool.folder = toolsPath.resolve(folders.get(0)).toAbsolutePath().toString();
+				toolInstalled(tool, envList);
+			}
+
+		}catch(Exception e) {}
+	}
+
+	private static void installAtsTool(AtsToolEnvironment tool, List<String> envList) {
+		if(tool.folderName == null) {
+
+			final File[] files = Paths.get(atsToolsFolder).toFile().listFiles();
+			Arrays.sort(files, Comparator.comparingLong(File::lastModified));
+
+			for(File f : files) {
+				if(f.getName().startsWith(tool.name)) {
+					tool.folderName = f.getName();
+					tool.folder = f.getAbsolutePath();
+					break;
+				}
+			}
+
+		}else {
+			try {
+				final File tmpZipFile = Files.createTempDirectory("atsTool_").resolve( tool.folderName + ".zip").toAbsolutePath().toFile();
+				if(tmpZipFile.exists()) {
+					tmpZipFile.delete();
+				}
+
+				final HttpURLConnection con = (HttpURLConnection) new URL(tool.url).openConnection();
+
+				IntConsumer consume;
+				final int fileLength = con.getContentLength();
+				if(fileLength == -1) {
+					consume = (p) -> {System.out.println("Download [" + tool.name + "] -> " + p + " Mo");};
+				}else {
+					consume = (p) -> {System.out.println("Download [" + tool.name + "] -> " + p + " %");};
+				}
+
+				ReadableConsumerByteChannel rcbc = new ReadableConsumerByteChannel(
+						Channels.newChannel(con.getInputStream()),
+						fileLength,
+						consume);
+
+				final FileOutputStream fosx = new FileOutputStream(tmpZipFile);
+				fosx.getChannel().transferFrom(rcbc, 0, Long.MAX_VALUE);
+				fosx.close();
+
+				byte[] buffer = new byte[1024];
+
+				try (ZipInputStream zis = new ZipInputStream(new FileInputStream(tmpZipFile))) {
+					ZipEntry zipEntry = zis.getNextEntry();
+
+					while (zipEntry != null) {
+						final File newFile = newFile(Paths.get(atsToolsFolder).toFile(), zipEntry);
+						if(newFile != null && !newFile.exists()) {
+							if (zipEntry.isDirectory()) {
+
+								if (!newFile.isDirectory() && !newFile.mkdirs()) {
+									throw new IOException("Failed to create directory " + newFile);
+								}
+
+							} else {
+
+								final File parent = newFile.getParentFile();
+								if (!parent.isDirectory() && !parent.mkdirs()) {
+									throw new IOException("Failed to create directory " + parent);
+								}
+
+								final FileOutputStream fos = new FileOutputStream(newFile);
+								int len;
+								while ((len = zis.read(buffer)) > 0) {
+									fos.write(buffer, 0, len);
+								}
+								fos.close();
+							}
+						}
+						zis.closeEntry();
+						zipEntry = zis.getNextEntry();
+					}
+
+					zis.close();
+				}
+
+			} catch (IOException e) {
+				//e.printStackTrace();
+			}
+
+			tool.folder = Paths.get(atsToolsFolder).resolve(tool.folderName).toFile().getAbsolutePath();
+		}
+
+		if(tool.folder == null) {
+			throw new RuntimeException("ATS tool is not installed on this system -> " + tool.name);
+		}else {
+			toolInstalled(tool, envList);
+		}
+	}
+
+	//------------------------------------------------------------------------------------------------------------
+	// Classes
+	//------------------------------------------------------------------------------------------------------------
+
+	private static class FullLogConsumer implements Consumer<String> {
+		@Override
+		public void accept(String s) {
+			System.out.println(s);
+		}
+	}
+
+	private static class TestNGLogConsumer implements Consumer<String> {
+		@Override
+		public void accept(String s) {
+			System.out.println(
+					s.replace("[TestNG]", "")
+					.replace("[main] INFO org.testng.internal.Utils -", "[TestNG]")
+					.replace("Warning: [org.testng.ITest]", "[TestNG] Warning :")
+					.replace("[main] INFO org.testng.TestClass", "[TestNG]")
+					);
+		}
+	}
+
+	private static class StreamGobbler extends Thread {
+		private InputStream inputStream;
+		private Consumer<String> consumer;
+
+		public StreamGobbler(InputStream inputStream, Consumer<String> consumer) {
+			this.inputStream = inputStream;
+			this.consumer = consumer;
+		}
+
+		@Override
+		public void run() {
+			new BufferedReader(new InputStreamReader(inputStream)).lines().forEach(consumer);
+		}
+	}
+
+	private static class AtsToolEnvironment{
+
+		public String name;
+		public String envName;
+		public String folder;
+		public String folderName;
+
+		public String url;
+
+		public AtsToolEnvironment(String name) {
+			this.name = name;
+			this.envName = name.toUpperCase() + "_HOME";
+		}
+	}
+
+	private static class ReadableConsumerByteChannel implements ReadableByteChannel {
+
+		private final ReadableByteChannel rbc;
+		private final IntConsumer onRead;
+		private final int totalBytes;
+
+		private int totalByteRead;
+
+		private int currentPercent = 0;
+
+		public ReadableConsumerByteChannel(ReadableByteChannel rbc, int totalBytes, IntConsumer onBytesRead) {
+			this.rbc = rbc;
+			this.totalBytes = totalBytes;
+			this.onRead = onBytesRead;
+		}
+
+		@Override
+		public int read(ByteBuffer dst) throws IOException {
+			int nRead = rbc.read(dst);
+			notifyBytesRead(nRead);
+			return nRead;
+		}
+
+		protected void notifyBytesRead(int nRead){
+			if(nRead<=0) {
+				return;
+			}
+			totalByteRead += nRead;
+
+			if(totalBytes != -1) {
+				int percent = (int)(((float)totalByteRead/totalBytes)*100);
+				if(percent % 5 == 0 && currentPercent != percent) {
+					currentPercent = percent;
+					onRead.accept(currentPercent);
+				}
+			}else if (totalByteRead % 10000 == 0) {
+				onRead.accept(totalByteRead/10000);
+			}
+		}
+
+		@Override
+		public boolean isOpen() {
+			return rbc.isOpen();
+		}
+
+		@Override
+		public void close() throws IOException {
+			rbc.close();
+		}
+	}
+
+	//------------------------------------------------------------------------------------------------------------
+	// Utils
+	//------------------------------------------------------------------------------------------------------------
+
+	private static void printLog(String data) {
+		System.out.println("[ATS-LAUNCHER] " + data);
+	}
+
+	private static void execute(StringBuilder command, String[] envp, File currentDir, Consumer<String> outputConsumer, Consumer<String> errorConsumer) throws IOException, InterruptedException {
+
+		final Process p = Runtime.getRuntime().exec(command.toString(), envp, currentDir);
+
+		new StreamGobbler(p.getErrorStream(), errorConsumer).start();
+		new StreamGobbler(p.getInputStream(), outputConsumer).start();
+
+		p.waitFor();
+	}
+
+	//------------------------------------------------------------------------------------------------------------
+	// Files
+	//------------------------------------------------------------------------------------------------------------
 
 	private static void copyFolder(Path src, Path dest) throws IOException {
 		try (Stream<Path> stream = Files.walk(src)) {
@@ -129,122 +779,26 @@ public class AtsLauncher {
 		}
 	}
 
-	private static void listJavaClasses(StringJoiner list, int subLen, File directory) {
-		File[] fList = directory.listFiles();
-		for (File file : fList) {
-			if (file.isFile()) {
-				if(file.getName().endsWith(".java")) {
-					list.add(file.getAbsolutePath().substring(subLen).replaceAll("\\\\", "/"));
-				}
-			} else if (file.isDirectory()) {
-				listJavaClasses(list, subLen, file);
-			}
-		}
-	}
+	private static ArrayList<String> listJavaClasses(int subLen, File directory) {
 
-	private static void execute(String commandLine, String[] envp, File currentDir) throws IOException, InterruptedException {
-		final Process p = Runtime.getRuntime().exec(commandLine, envp, currentDir);
-		new Thread(new Runnable() {
-			public void run() {
-				BufferedReader input = new BufferedReader(new InputStreamReader(p.getInputStream()));
-				String line = null;
-				try {
-					while ((line = input.readLine()) != null)
-						System.out.println(line);
-				} catch (IOException e) {
-					e.printStackTrace();
-				}
-			}
-		}).start();
-		p.waitFor();
-	}
+		final ArrayList<String> list = new ArrayList<String>();
+		final File[] fList = directory.listFiles();
 
-	private static String[] createEnVar(List<String> envList, String toolName, Path atsTools) throws IOException {
-		final String toolPath = installTool(atsTools, toolName);
-		final String envName = toolName.toUpperCase() + "_HOME";
-
-		printLog("Set environment variable [" + envName + "] to " + toolPath);
-
-		envList.add(envName + "=" + toolPath);
-
-		return new String[]{envName, toolPath};
-	}
-
-	private static String installTool(Path atsTools, String toolName) throws IOException {
-
-		final URLConnection connection = new URL(atsToolsUrl + "/tools/" + toolName + ".zip").openConnection();
-		final String lastModified = connection.getHeaderField("Last-Modified");
-
-		final String toolPath = checkTool(lastModified, atsTools, toolName);
-		if(toolPath != null) {
-			return toolPath;
-		}
-
-		printLog("Unpacking tool [" + toolName + "] to folder : " + atsTools.toString());
-
-		final Path tmpZip = Files.createTempDirectory("atsTool_").resolve(toolName + ".zip");
-		final InputStream in = new URL(atsToolsUrl + "/tools/" + toolName + ".zip").openStream();
-		Files.copy(in, tmpZip, StandardCopyOption.REPLACE_EXISTING);
-
-		String newToolPath = null;
-
-		byte[] buffer = new byte[1024];
-
-		final ZipInputStream zis = new ZipInputStream(new FileInputStream(tmpZip.toFile()));
-		ZipEntry zipEntry = zis.getNextEntry();
-
-		while (zipEntry != null) {
-			final File newFile = newFile(atsTools.toFile(), zipEntry);
-			if(newFile != null && !newFile.exists()) {
-				if (zipEntry.isDirectory()) {
-
-					if (!newFile.isDirectory() && !newFile.mkdirs()) {
-						throw new IOException("Failed to create directory " + newFile);
+		if(fList == null) {
+			throw new RuntimeException("Directory list files return null value ! (" + directory.getAbsolutePath() + ")");
+		}else {
+			for (File file : fList) {
+				if (file.isFile()) {
+					if(file.getName().endsWith(".java")) {
+						list.add(file.getAbsolutePath().substring(subLen).replaceAll("\\\\", "/"));
 					}
-
-					if(newToolPath == null) {
-						Files.write(atsTools.resolve(zipEntry.getName()).resolve(".timestamp"), lastModified.getBytes(), StandardOpenOption.CREATE_NEW);
-						newToolPath = newFile.getAbsolutePath();
-					}
-
-				} else {
-
-					final File parent = newFile.getParentFile();
-					if (!parent.isDirectory() && !parent.mkdirs()) {
-						throw new IOException("Failed to create directory " + parent);
-					}
-
-					final FileOutputStream fos = new FileOutputStream(newFile);
-					int len;
-					while ((len = zis.read(buffer)) > 0) {
-						fos.write(buffer, 0, len);
-					}
-					fos.close();
-				}
-			}
-			zipEntry = zis.getNextEntry();
-		}
-
-		zis.closeEntry();
-		zis.close();
-
-		return newToolPath;
-	}
-
-	private static String checkTool(String lastModified, Path atsTools, String toolName) throws IOException {
-		final File[] fs = atsTools.toFile().listFiles((dir, name) -> name.startsWith(toolName + "-"));
-		if(fs != null) {
-			for(File f : fs) {
-				if(f.isDirectory()) {
-					final Path ts = f.toPath().resolve(".timestamp");
-					if(Files.exists(ts) && lastModified.equals(Files.readString(ts, StandardCharsets.UTF_8))) {
-						return f.getAbsolutePath();
-					}
-					deleteDirectory(f.toPath());
+				} else if (file.isDirectory()) {
+					list.addAll(listJavaClasses(subLen, file));
 				}
 			}
 		}
-		return null;
+
+		return list;
 	}
 
 	private static File newFile(File destinationDir, ZipEntry zipEntry) throws IOException {
@@ -276,5 +830,42 @@ public class AtsLauncher {
 				}
 			});
 		}
+	}
+
+	//------------------------------------------------------------------------------------------------------------
+	// Tools
+	//------------------------------------------------------------------------------------------------------------
+
+	public static void disableSSL() throws NoSuchAlgorithmException, KeyManagementException {
+
+		// Create a trust manager that does not validate certificate chains
+		TrustManager[] trustAllCerts = new TrustManager[] {new X509TrustManager() {
+
+			public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+				return null;
+			}
+
+			public void checkClientTrusted(X509Certificate[] certs, String authType) {}
+			public void checkServerTrusted(X509Certificate[] certs, String authType) {}
+		}};
+
+		// Install the all-trusting trust manager
+
+		SSLContext sc = SSLContext.getInstance("SSL");
+		sc.init(null, trustAllCerts, new java.security.SecureRandom());
+
+		HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+
+		// Create all-trusting host name verifier
+
+		HostnameVerifier allHostsValid = new HostnameVerifier() {
+			@Override
+			public boolean verify(String hostname, SSLSession session) {
+				return true;
+			}
+		};
+
+		// Install the all-trusting host verifier
+		HttpsURLConnection.setDefaultHostnameVerifier(allHostsValid);
 	}
 }
