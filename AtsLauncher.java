@@ -46,8 +46,6 @@ import javax.net.ssl.X509TrustManager;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
-import com.ats.tools.Utils;
-import com.ats.tools.report.CampaignReportGenerator;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -323,11 +321,19 @@ public class AtsLauncher {
             atsToolsFolder = System.getenv("ATS_TOOLS");
         }
 
-        if(reportLevel.isEmpty()){
-            int tmp = Utils.string2Int(System.getenv(CampaignReportGenerator.ATS_REPORT_ENV),0);
-            if(tmp > 0 && tmp < 4){
+        if (reportLevel.isEmpty()) {
+            String reportParam = System.getenv("ATS_REPORT");
+            int tmp = 0;
+            if (reportParam != null && !reportParam.isEmpty()) {
+                try {
+                    tmp = Integer.parseInt(reportParam);
+                }catch (NumberFormatException e){
+                    printLog("parameter can not be interpreted as number");
+                }
+            }
+            if (tmp > 0 && tmp < 4) {
                 reportLevel = Integer.toString(tmp);
-            }else{
+            } else {
                 reportLevel = "0";
             }
         }
